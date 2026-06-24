@@ -1,0 +1,163 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+readonly SCRIPT_NAME=$(basename "$0")
+
+usage() {
+  cat >&2 <<USAGE
+
+  ${SCRIPT_NAME} - Merge JWKS in a single key set by sourcing locally or remotely
+
+USAGE:
+  ${SCRIPT_NAME} [OPTIONS] <jwks1> <jwks2> <jwks3> ...
+
+OPTIONAL:
+  -o, --output </path/to/file>          Output jwks.json (default: /dev/stdout)
+  -s, --sig-only                            Filter out keys where use != "sig"
+  -h, --help                            Show this help message
+
+USAGE
+  exit "${1:-1}"
+}
+
+# Helpers
+
+readonly BLUE='\033[34m'
+readonly GREEN='\033[32m'
+readonly RED='\033[31m'
+readonly RESET='\033[0m'
+
+log_info() {
+    echo -e "${BLUE}[INFO]${RESET}  $1" >&2
+}
+
+log_ok() {
+    echo -e "${GREEN}[OK]${RESET}    $1" >&2
+}
+
+log_error() {
+    echo -e "${RED}[ERROR]${RESET} $1" >&2
+}
+
+# Preflight — check required binaries
+
+REQUIRED_BINS=(curl jq)
+missing=()
+
+for bin in "${REQUIRED_BINS[@]}"; do
+    if ! command -v "${bin}" &> /dev/null; then
+        missing+=("${bin}")
+    fi
+done
+
+if [[ ${#missing[@]} -gt 0 ]]; then
+    log_error "Missing required binaries: ${missing[*]}"
+    exit 1
+fi
+
+# Check args
+
+OUTPUT="/dev/stdout"
+SOURCES=()
+SIG_ONLY=0
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -h|--help)
+      usage 0
+      ;;
+    -o|--output)
+      [[ -z "${2:-}" ]] && { log_error "missing value for '$1'"; echo "" >&2; usage; }
+      OUTPUT="$2"
+      shift 2
+      ;;
+    -s|--sig-only)
+      SIG_ONLY=1
+      shift
+      ;;
+    -*)
+      log_error "unknown option '$1'"; echo "" >&2; usage
+      ;;
+    *)
+      SOURCES+=("$1"); shift
+      ;;
+  esac
+done
+
+[[ ${#SOURCES[@]} -eq 0 ]] && { log_error "at least one JWKS source is required"; echo "" >&2; usage; }
+
+## fetches oidc config and takes the jwks_uri
+## $1: issuer base URL
+oidc_configuration() {
+  local issuer="${1%/}"
+  local config_url="${issuer}/.well-known/openid-configuration"
+  local config jwks_uri
+
+  log_info "Fetching OIDC configuration from: ${config_url}"
+  config=$(curl -fsSL "${config_url}") || { log_error "Failed to fetch OIDC config from '${config_url}'"; return 1; }
+
+  jwks_uri=$(echo "${config}" | jq -r '.jwks_uri // empty')
+  [[ -z "${jwks_uri}" ]] && { log_error "No 'jwks_uri' found in OIDC config at '${config_url}'"; return 1; }
+
+  log_ok "Resolved jwks_uri: ${jwks_uri}"
+  echo "${jwks_uri}"
+}
+
+## fetches jwks content
+## $1: URL or local file path
+fetch_jwks() {
+  local source="$1"
+  local content
+
+  if [[ "${source}" =~ ^https?:// ]]; then
+    log_info "Fetching JWKS from URL: ${source}"
+    content=$(curl -fsSL "${source}") || { log_error "Failed to fetch JWKS from '${source}'"; return 1; }
+  else
+    [[ -f "${source}" ]] || { log_error "File not found: '${source}'"; return 1; }
+    log_info "Reading JWKS from file: ${source}"
+    content=$(cat "${source}")
+  fi
+
+  echo "${content}" | jq -e '.keys | arrays' &>/dev/null \
+    || { log_error "Invalid JWKS (missing 'keys' array) from '${source}'"; return 1; }
+
+  log_ok "Loaded JWKS from: ${source}"
+  echo "${content}"
+}
+
+## Main
+
+all_keys=()
+
+for source in "${SOURCES[@]}"; do
+  jwks_target="${source}"
+
+  if [[ "${source}" =~ ^https?:// ]]; then
+    # try OIDC discovery; fall back to treating the URL as a direct JWKS endpoint
+    resolved=$(oidc_configuration "${source}" 2>/dev/null) && jwks_target="${resolved}" || jwks_target="${source}"
+  fi
+
+  jwks=$(fetch_jwks "${jwks_target}")
+  while IFS= read -r key; do
+    all_keys+=("${key}")
+  done < <(echo "${jwks}" | jq -c --argjson sig_only "${SIG_ONLY}" '.keys[] | select($sig_only == 0 or .use == "sig")')
+done
+
+
+if [[ ${SIG_ONLY} -eq 1 ]]; then
+  log_info 'Filtering: only keys with use="sig" are included'
+fi
+
+# Check for duplicate kids
+duplicate_kids=$(printf '%s\n' "${all_keys[@]}" | jq -r '.kid // empty' | sort | uniq -d)
+if [[ -n "${duplicate_kids}" ]]; then
+  while IFS= read -r kid; do
+    log_error "Duplicate kid found: '${kid}'"
+  done <<< "${duplicate_kids}"
+  exit 1
+fi
+log_info "Merging ${#all_keys[@]} key(s) → ${OUTPUT}"
+printf '%s\n' "${all_keys[@]}" | jq -s '{"keys": .}' > "${OUTPUT}"
+log_ok "Done."
