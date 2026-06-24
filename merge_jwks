@@ -15,7 +15,7 @@ USAGE:
 
 OPTIONAL:
   -o, --output </path/to/file>          Output jwks.json (default: /dev/stdout)
-  -s, --sig-only                            Filter out keys where use != "sig"
+  -s, --sig-only                        Filter out keys where use != "sig"
   -h, --help                            Show this help message
 
 USAGE
@@ -159,5 +159,5 @@ if [[ -n "${duplicate_kids}" ]]; then
   exit 1
 fi
 log_info "Merging ${#all_keys[@]} key(s) → ${OUTPUT}"
-printf '%s\n' "${all_keys[@]}" | jq -s '{"keys": .}' > "${OUTPUT}"
+printf '%s\n' "${all_keys[@]}" | jq -s '{"keys": sort_by(.kid)}' > "${OUTPUT}"
 log_ok "Done."
